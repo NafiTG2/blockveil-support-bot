@@ -11,9 +11,9 @@ from telegram.ext import (
     filters,
 )
 import os
-import random
-import string
 import html
+import hashlib
+import secrets
 from io import BytesIO
 from datetime import datetime
 import time
@@ -51,10 +51,23 @@ def register_user(user):
     user_latest_username[user.id] = user.username or ""
 
 # ================= HELPERS =================
-def generate_ticket_id(length=8):
-    chars = string.ascii_letters + string.digits + "*#@$&"
+def generate_ticket_id(user_id: int) -> str:
+    """
+    Generate a cryptographically unique ticket ID using SHA-256.
+
+    Input  : user_id  (int)  +  high-entropy random salt  +  nanosecond timestamp
+    Process: SHA-256(user_id | salt | timestamp_ns)
+    Output : "BV-" + first 10 hex chars of digest  →  e.g. BV-3f9a1c02b7
+
+    Collision probability with 10 hex chars (40-bit space): ~1 in 1,099,511,627,776
+    Salt ensures two tickets from the same user are always distinct.
+    """
     while True:
-        tid = "BV-" + "".join(random.choice(chars) for _ in range(length))
+        salt = secrets.token_hex(16)                        # 128-bit CSPRNG salt
+        timestamp_ns = str(time.time_ns())                  # nanosecond precision
+        raw = f"{user_id}:{salt}:{timestamp_ns}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        tid = "BV-" + digest[:10]                           # 10 hex chars = 40-bit space
         if tid not in ticket_status:
             return tid
 
@@ -119,7 +132,7 @@ async def create_ticket(update: Update, context):
         )
         return
 
-    ticket_id = generate_ticket_id()
+    ticket_id = generate_ticket_id(user.id)
     user_active_ticket[user.id] = ticket_id
     ticket_status[ticket_id] = "Pending"
     ticket_user[ticket_id] = user.id
