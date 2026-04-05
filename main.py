@@ -16,6 +16,7 @@ import hashlib
 import secrets
 import sqlite3
 import threading
+import json
 from io import BytesIO
 from datetime import datetime
 import time
@@ -1021,6 +1022,166 @@ async def send_video(u, c):     await send_media(u, c, "video")
 async def send_animation(u, c): await send_media(u, c, "animation")
 async def send_sticker(u, c):   await send_media(u, c, "sticker")
 
+# ================= /exportall =================
+async def export_all(update: Update, context):
+    if update.effective_chat.id != GROUP_ID:
+        return
+
+    with get_conn() as conn:
+        users   = [dict(r) for r in conn.execute("SELECT * FROM users").fetchall()]
+        tickets = [dict(r) for r in conn.execute("SELECT * FROM tickets").fetchall()]
+        msgs    = [dict(r) for r in conn.execute("SELECT * FROM messages").fetchall()]
+        gmmap   = [dict(r) for r in conn.execute("SELECT * FROM group_message_map").fetchall()]
+
+    payload = {
+        "exported_at": get_bst_now(),
+        "users":             users,
+        "tickets":           tickets,
+        "messages":          msgs,
+        "group_message_map": gmmap,
+    }
+
+    buf      = BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode())
+    buf.name = f"blockveil_backup_{get_bst_now().replace(' ', '_').replace(':', '-')}.json"
+
+    await context.bot.send_document(
+        chat_id=GROUP_ID,
+        document=buf,
+        caption=(
+            f"🗄 <b>Full Database Export</b>\n\n"
+            f"👥 Users    : {len(users)}\n"
+            f"🎫 Tickets  : {len(tickets)}\n"
+            f"💬 Messages : {len(msgs)}\n"
+            f"🗺 Msg Map  : {len(gmmap)}\n\n"
+            f"📅 Exported : {get_bst_now()} BST\n\n"
+            f"To restore, reply to this file with /importall"
+        ),
+        parse_mode="HTML"
+    )
+
+# ================= /importall =================
+async def import_all(update: Update, context):
+    if update.effective_chat.id != GROUP_ID:
+        return
+
+    # Must reply to a document
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text(
+            "❌ Reply to the exported .json file with /importall",
+            parse_mode="HTML"
+        )
+        return
+
+    doc = update.message.reply_to_message.document
+    if not doc.file_name.endswith(".json"):
+        await update.message.reply_text(
+            "❌ File must be a .json export from /exportall",
+            parse_mode="HTML"
+        )
+        return
+
+    # Download and parse
+    try:
+        file     = await context.bot.get_file(doc.file_id)
+        buf      = BytesIO()
+        await file.download_to_memory(buf)
+        buf.seek(0)
+        payload  = json.loads(buf.read().decode())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to read file: {e}", parse_mode="HTML")
+        return
+
+    # Validate structure
+    required_keys = {"users", "tickets", "messages", "group_message_map"}
+    if not required_keys.issubset(payload.keys()):
+        await update.message.reply_text(
+            "❌ Invalid backup file. Missing required keys.", parse_mode="HTML"
+        )
+        return
+
+    users_i = tickets_i = msgs_i = gmmap_i = 0
+    users_s = tickets_s = msgs_s = gmmap_s = 0
+
+    try:
+        with _db_lock, get_conn() as conn:
+
+            # ---- users ----
+            for u in payload["users"]:
+                try:
+                    conn.execute("""
+                        INSERT INTO users(user_id, username, first_name)
+                        VALUES(:user_id, :username, :first_name)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            username   = excluded.username,
+                            first_name = excluded.first_name
+                    """, u)
+                    users_i += 1
+                except Exception:
+                    users_s += 1
+
+            # ---- tickets ----
+            for t in payload["tickets"]:
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO tickets
+                            (ticket_id, user_id, username, status, created_at)
+                        VALUES(:ticket_id, :user_id, :username, :status, :created_at)
+                    """, t)
+                    if conn.execute(
+                        "SELECT changes()"
+                    ).fetchone()[0] == 0:
+                        tickets_s += 1
+                    else:
+                        tickets_i += 1
+                except Exception:
+                    tickets_s += 1
+
+            # ---- messages (use original id to avoid duplicates) ----
+            for m in payload["messages"]:
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO messages
+                            (id, ticket_id, sender, content, timestamp)
+                        VALUES(:id, :ticket_id, :sender, :content, :timestamp)
+                    """, m)
+                    if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                        msgs_s += 1
+                    else:
+                        msgs_i += 1
+                except Exception:
+                    msgs_s += 1
+
+            # ---- group_message_map ----
+            for g in payload["group_message_map"]:
+                try:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO group_message_map
+                            (tg_message_id, ticket_id)
+                        VALUES(:tg_message_id, :ticket_id)
+                    """, g)
+                    if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                        gmmap_s += 1
+                    else:
+                        gmmap_i += 1
+                except Exception:
+                    gmmap_s += 1
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Import failed: {e}", parse_mode="HTML")
+        return
+
+    exported_at = payload.get("exported_at", "Unknown")
+    await update.message.reply_text(
+        f"✅ <b>Import Complete</b>\n\n"
+        f"📅 Backup date : {exported_at} BST\n\n"
+        f"👥 Users    : {users_i} imported, {users_s} skipped\n"
+        f"🎫 Tickets  : {tickets_i} imported, {tickets_s} skipped\n"
+        f"💬 Messages : {msgs_i} imported, {msgs_s} skipped\n"
+        f"🗺 Msg Map  : {gmmap_i} imported, {gmmap_s} skipped\n\n"
+        f"⚠️ Skipped rows already existed in the database.",
+        parse_mode="HTML"
+    )
+
 # ================= INIT =================
 init_db()
 
@@ -1046,6 +1207,9 @@ app.add_handler(CommandHandler("send_voice",     send_voice))
 app.add_handler(CommandHandler("send_video",     send_video))
 app.add_handler(CommandHandler("send_animation", send_animation))
 app.add_handler(CommandHandler("send_sticker",   send_sticker))
+
+app.add_handler(CommandHandler("exportall",    export_all))
+app.add_handler(CommandHandler("importall",    import_all))
 
 app.add_handler(CallbackQueryHandler(create_ticket, pattern="create_ticket"))
 app.add_handler(CallbackQueryHandler(profile,       pattern="profile"))
